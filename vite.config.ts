@@ -11,9 +11,9 @@ export default defineConfig({
 					filename.split(/[/\\]/).includes('node_modules') ? undefined : true
 			},
 
-			// The whole page is client-only (ssr = false in +page.ts), so build it as a
-			// static SPA shell: no server/runtime needed at all, just static files.
-			adapter: adapter({ fallback: 'index.html' })
+			// The whole app is client-only (ssr = false in +layout.ts) and prerendered
+			// to a static index.html, so it deploys as plain static files.
+			adapter: adapter()
 		})
 	]
 });

@@ -1,22 +1,6 @@
-# sv
+# noise
 
-Everything you need to build a Svelte project, powered by [`sv`](https://github.com/sveltejs/cli).
-
-## Creating a project
-
-If you're seeing this, you've probably already done this step. Congrats!
-
-```sh
-# create a new project
-npx sv create my-app
-```
-
-To recreate this project with the same configuration:
-
-```sh
-# recreate this project
-npx sv@0.16.2 create --template minimal --types ts --install npm noise
-```
+A single-page white noise generator for babies, built for mobile. Web Audio (via an `AudioWorklet`) generates continuous noise that you shape with a dual-handle band-pass slider, and a mute button fades the sound in gently and out quickly. It's a static, client-only SvelteKit app with no backend.
 
 ## Developing
 
