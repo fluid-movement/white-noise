@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { onMount } from "svelte";
+
   const MIN_HZ = 50;
   const MAX_HZ = 1500;
   const MIN_GAP = 0.05;
@@ -35,15 +37,26 @@
   let dragging: "low" | "high" | null = $state(null);
 
   let track: HTMLDivElement;
+  let audioEl: HTMLAudioElement;
 
   let ctx: AudioContext | null = null;
   let highpass: BiquadFilterNode | null = null;
   let lowpass: BiquadFilterNode | null = null;
   let gain: GainNode | null = null;
+  let mediaStreamDest: MediaStreamAudioDestinationNode | null = null;
 
   async function ensureAudio() {
     if (ctx) return;
     ctx = new AudioContext();
+
+    // Route through a real <audio> element (instead of ctx.destination) and
+    // start it playing synchronously, before any await, so mobile browsers
+    // recognize this as genuine media playback and grant background/locked
+    // screen execution instead of throttling the tab.
+    mediaStreamDest = ctx.createMediaStreamDestination();
+    audioEl.srcObject = mediaStreamDest.stream;
+    audioEl.play().catch(() => {});
+
     await ctx.audioWorklet.addModule("/noise-processor.js");
     const noise = new AudioWorkletNode(ctx, "noise-processor");
     highpass = new BiquadFilterNode(ctx, {
@@ -59,23 +72,74 @@
       .connect(highpass)
       .connect(lowpass)
       .connect(gain)
-      .connect(ctx.destination);
+      .connect(mediaStreamDest);
+
+    setupMediaSession();
   }
 
-  async function toggle() {
+  function setupMediaSession() {
+    if (!("mediaSession" in navigator)) return;
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: "White Noise",
+      artist: "Noise",
+      artwork: [{ src: "/favicon.svg", sizes: "any", type: "image/svg+xml" }],
+    });
+    navigator.mediaSession.setActionHandler("play", () => play());
+    navigator.mediaSession.setActionHandler("pause", () => pause());
+    navigator.mediaSession.setActionHandler("stop", () => pause());
+  }
+
+  async function play() {
     await ensureAudio();
     if (!ctx || !gain) return;
     if (ctx.state === "suspended") await ctx.resume();
+    if (audioEl.paused) await audioEl.play().catch(() => {});
 
     const now = ctx.currentTime;
     gain.gain.cancelScheduledValues(now);
     gain.gain.setValueAtTime(gain.gain.value, now);
-    gain.gain.linearRampToValueAtTime(
-      playing ? 0.0001 : 1,
-      now + (playing ? FADE_OUT : FADE_IN),
-    );
-    playing = !playing;
+    gain.gain.linearRampToValueAtTime(1, now + FADE_IN);
+    playing = true;
+    if ("mediaSession" in navigator) {
+      navigator.mediaSession.playbackState = "playing";
+    }
   }
+
+  async function pause() {
+    if (!ctx || !gain) return;
+
+    const now = ctx.currentTime;
+    gain.gain.cancelScheduledValues(now);
+    gain.gain.setValueAtTime(gain.gain.value, now);
+    gain.gain.linearRampToValueAtTime(0.0001, now + FADE_OUT);
+    playing = false;
+    if ("mediaSession" in navigator) {
+      navigator.mediaSession.playbackState = "paused";
+    }
+  }
+
+  async function toggle() {
+    if (playing) {
+      await pause();
+    } else {
+      await play();
+    }
+  }
+
+  function recoverPlayback() {
+    if (document.visibilityState !== "visible" || !playing || !ctx) return;
+    if (ctx.state === "suspended") ctx.resume();
+    if (audioEl && audioEl.paused) audioEl.play().catch(() => {});
+  }
+
+  onMount(() => {
+    document.addEventListener("visibilitychange", recoverPlayback);
+    window.addEventListener("pageshow", recoverPlayback);
+    return () => {
+      document.removeEventListener("visibilitychange", recoverPlayback);
+      window.removeEventListener("pageshow", recoverPlayback);
+    };
+  });
 
   function updateFilters() {
     if (!ctx || !highpass || !lowpass) return;
@@ -117,6 +181,8 @@
 </script>
 
 <main>
+  <audio bind:this={audioEl} hidden></audio>
+
   <button
     type="button"
     class="toggle"
