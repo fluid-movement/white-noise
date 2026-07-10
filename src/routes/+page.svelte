@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { onMount } from "svelte";
+
   const MIN_HZ = 50;
   const MAX_HZ = 1500;
   const MIN_GAP = 0.05;
@@ -52,6 +54,16 @@
   async function ensureAudio() {
     if (ctx) return;
     ctx = new AudioContext();
+
+    // Wire up the media sink and start the <audio> element playing *before* any
+    // await, so the first tap's user-gesture activation isn't already spent by
+    // the time play() runs. Mobile browsers only exempt a genuinely-playing
+    // media element from background / lock-screen throttling. The stream is
+    // silent until the graph is connected just below.
+    streamDest = ctx.createMediaStreamDestination();
+    audioEl.srcObject = streamDest.stream;
+    audioEl.play().catch(() => {});
+
     await ctx.audioWorklet.addModule("/noise-processor.js");
     const noise = new AudioWorkletNode(ctx, "noise-processor");
     highpass = new BiquadFilterNode(ctx, {
@@ -63,9 +75,7 @@
       frequency: toHz(high),
     });
     gain = new GainNode(ctx, { gain: 0 });
-    streamDest = ctx.createMediaStreamDestination();
     noise.connect(highpass).connect(lowpass).connect(gain).connect(streamDest);
-    audioEl.srcObject = streamDest.stream;
   }
 
   function fadeGain(target: number, duration: number) {
@@ -122,6 +132,24 @@
     if (playing) pausePlayback();
     else resumePlayback();
   }
+
+  // Recovery net: if the OS suspended the context / media element while we were
+  // backgrounded, resume them when the page becomes visible again. Mainly
+  // relevant on iOS, where background suspension is less predictable.
+  function recoverPlayback() {
+    if (document.visibilityState !== "visible" || !playing || !ctx) return;
+    if (ctx.state === "suspended") ctx.resume();
+    if (audioEl?.paused) audioEl.play().catch(() => {});
+  }
+
+  onMount(() => {
+    document.addEventListener("visibilitychange", recoverPlayback);
+    window.addEventListener("pageshow", recoverPlayback);
+    return () => {
+      document.removeEventListener("visibilitychange", recoverPlayback);
+      window.removeEventListener("pageshow", recoverPlayback);
+    };
+  });
 
   function updateFilters() {
     if (!ctx || !highpass || !lowpass) return;
