@@ -40,6 +40,14 @@
   let highpass: BiquadFilterNode | null = null;
   let lowpass: BiquadFilterNode | null = null;
   let gain: GainNode | null = null;
+  // Terminal sink: the graph feeds a MediaStream that a real <audio> element
+  // plays. Chrome/Android only keeps a bare AudioContext running in the
+  // background when its output drives an actively-playing media element, so
+  // this is what keeps the noise alive with the screen locked or the app
+  // backgrounded (and it's what surfaces the lock-screen media controls).
+  let streamDest: MediaStreamAudioDestinationNode | null = null;
+  let audioEl: HTMLAudioElement;
+  let mediaSessionReady = false;
 
   async function ensureAudio() {
     if (ctx) return;
@@ -55,26 +63,64 @@
       frequency: toHz(high),
     });
     gain = new GainNode(ctx, { gain: 0 });
-    noise
-      .connect(highpass)
-      .connect(lowpass)
-      .connect(gain)
-      .connect(ctx.destination);
+    streamDest = ctx.createMediaStreamDestination();
+    noise.connect(highpass).connect(lowpass).connect(gain).connect(streamDest);
+    audioEl.srcObject = streamDest.stream;
   }
 
-  async function toggle() {
-    await ensureAudio();
+  function fadeGain(target: number, duration: number) {
     if (!ctx || !gain) return;
-    if (ctx.state === "suspended") await ctx.resume();
-
     const now = ctx.currentTime;
     gain.gain.cancelScheduledValues(now);
     gain.gain.setValueAtTime(gain.gain.value, now);
-    gain.gain.linearRampToValueAtTime(
-      playing ? 0.0001 : 1,
-      now + (playing ? FADE_OUT : FADE_IN),
-    );
-    playing = !playing;
+    gain.gain.linearRampToValueAtTime(target, now + duration);
+  }
+
+  function setPlaybackState(state: MediaSessionPlaybackState) {
+    if ("mediaSession" in navigator) navigator.mediaSession.playbackState = state;
+  }
+
+  function setupMediaSession() {
+    if (mediaSessionReady || !("mediaSession" in navigator)) return;
+    mediaSessionReady = true;
+    if (typeof MediaMetadata !== "undefined") {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: "White Noise",
+        artist: "Noise",
+        artwork: [
+          { src: "/icons/icon-512.png", sizes: "512x512", type: "image/png" },
+        ],
+      });
+    }
+    navigator.mediaSession.setActionHandler("play", () => resumePlayback());
+    navigator.mediaSession.setActionHandler("pause", () => pausePlayback());
+  }
+
+  async function resumePlayback() {
+    await ensureAudio();
+    if (!ctx || !gain) return;
+    if (ctx.state === "suspended") await ctx.resume();
+    // Must run inside a user gesture the first time; the MediaSession play
+    // handler also counts as an activation on Android.
+    await audioEl.play().catch(() => {});
+    setupMediaSession();
+    fadeGain(1, FADE_IN);
+    playing = true;
+    setPlaybackState("playing");
+  }
+
+  function pausePlayback() {
+    if (!ctx || !gain) return;
+    // Fade to (near) silence but keep the stream + <audio> element playing so
+    // resume is instant and doesn't need a fresh gesture.
+    fadeGain(0.0001, FADE_OUT);
+    playing = false;
+    setPlaybackState("paused");
+  }
+
+  function toggle() {
+    if (playing) pausePlayback();
+    else resumePlayback();
   }
 
   function updateFilters() {
@@ -115,6 +161,8 @@
     persist();
   }
 </script>
+
+<audio bind:this={audioEl} playsinline hidden></audio>
 
 <main>
   <button
