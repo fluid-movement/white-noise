@@ -17,16 +17,21 @@
     return hz >= 1000 ? `${(hz / 1000).toFixed(1)}kHz` : `${Math.round(hz)}Hz`;
   }
 
-  function loadStored(): { low: number; high: number } {
-    if (typeof localStorage === "undefined") return { low: 0, high: 0.6 };
+  function loadStored(): { low: number; high: number; stereo: boolean } {
+    const fallback = { low: 0, high: 0.6, stereo: true };
+    if (typeof localStorage === "undefined") return fallback;
     try {
       const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "null");
       if (typeof parsed?.low === "number" && typeof parsed?.high === "number")
-        return parsed;
+        return {
+          low: parsed.low,
+          high: parsed.high,
+          stereo: parsed.stereo ?? true,
+        };
     } catch {
       // ignore malformed storage
     }
-    return { low: 0, high: 0.6 };
+    return fallback;
   }
 
   const stored = loadStored();
@@ -34,6 +39,7 @@
   let playing = $state(false);
   let low = $state(stored.low);
   let high = $state(stored.high);
+  let stereo = $state(stored.stereo);
   let dragging: "low" | "high" | null = $state(null);
 
   let track: HTMLDivElement;
@@ -91,15 +97,25 @@
   // Render `dur` seconds of white noise through the highpass/lowpass band at the
   // given cutoffs. A hard loop point in filtered noise is imperceptible, so no
   // crossfade is needed. OfflineAudioContext needs no user gesture.
-  async function renderLoop(lowV: number, highV: number): Promise<Blob> {
+  async function renderLoop(
+    lowV: number,
+    highV: number,
+    stereoV: boolean,
+  ): Promise<Blob> {
     const sr = 44100;
     const dur = 15;
     const frames = sr * dur;
     const oac = new OfflineAudioContext(2, frames, sr);
     const noiseBuf = oac.createBuffer(2, frames, sr);
-    for (let ch = 0; ch < 2; ch++) {
-      const data = noiseBuf.getChannelData(ch);
-      for (let i = 0; i < frames; i++) data[i] = Math.random() * 2 - 1;
+    const left = noiseBuf.getChannelData(0);
+    const right = noiseBuf.getChannelData(1);
+    for (let i = 0; i < frames; i++) left[i] = Math.random() * 2 - 1;
+    // stereo → independent noise in the right channel (wide/decorrelated);
+    // mono → copy the left channel so both are identical (centered).
+    if (stereoV) {
+      for (let i = 0; i < frames; i++) right[i] = Math.random() * 2 - 1;
+    } else {
+      right.set(left);
     }
     const src = oac.createBufferSource();
     src.buffer = noiseBuf;
@@ -120,9 +136,9 @@
   // Render the loop for the current band and hand it to the <audio> element.
   // Pre-rendered on mount so the first play() can run synchronously inside the
   // tap gesture. `renderToken` discards a render that a newer one superseded.
-  async function setLoop(lowV: number, highV: number) {
+  async function setLoop(lowV: number, highV: number, stereoV: boolean) {
     const token = ++renderToken;
-    const blob = await renderLoop(lowV, highV);
+    const blob = await renderLoop(lowV, highV, stereoV);
     if (token !== renderToken) return;
     const url = URL.createObjectURL(blob);
     audioEl.src = url;
@@ -177,7 +193,7 @@
 
   async function startPlayback() {
     // src is normally pre-rendered on mount; guard in case it isn't ready yet.
-    if (!audioEl.src) await setLoop(low, high);
+    if (!audioEl.src) await setLoop(low, high, stereo);
     audioEl.loop = true;
     audioEl.volume = 0;
     try {
@@ -204,14 +220,21 @@
 
   onMount(() => {
     // Pre-render the stored band so the first tap plays instantly and in-gesture.
-    setLoop(low, high);
+    setLoop(low, high, stereo);
     return () => {
       if (currentUrl) URL.revokeObjectURL(currentUrl);
     };
   });
 
   function persist() {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ low, high }));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ low, high, stereo }));
+  }
+
+  function toggleStereo() {
+    stereo = !stereo;
+    persist();
+    // Re-render the loop with the new channel correlation (hot-swaps if playing).
+    setLoop(low, high, stereo);
   }
 
   function fractionFromPointer(clientX: number) {
@@ -239,7 +262,7 @@
     dragging = null;
     persist();
     // Re-render the loop for the new band (and hot-swap it if playing).
-    setLoop(low, high);
+    setLoop(low, high, stereo);
   }
 </script>
 
@@ -314,6 +337,21 @@
     <span class="label">bright</span>
   </div>
 
+  <button
+    type="button"
+    class="mode"
+    aria-pressed={stereo}
+    aria-label={stereo ? "Stereo mode, tap for mono" : "Mono mode, tap for stereo"}
+    onclick={toggleStereo}
+  >
+    <span class="mode-label" class:active={!stereo}>mono</span>
+    <svg class="venn" class:on={stereo} viewBox="0 0 60 34" aria-hidden="true">
+      <circle class="ring left" cx="24" cy="17" r="12" />
+      <circle class="ring right" cx="36" cy="17" r="12" />
+    </svg>
+    <span class="mode-label" class:active={stereo}>stereo</span>
+  </button>
+
   <span class="version">v2 · file-loop</span>
 </main>
 
@@ -351,6 +389,59 @@
     color: #33363f;
     letter-spacing: 0.03em;
     pointer-events: none;
+  }
+
+  .mode {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    background: none;
+    border: none;
+    padding: 0.25rem 0.5rem;
+    cursor: pointer;
+    touch-action: manipulation;
+  }
+
+  .mode-label {
+    font: 500 0.8rem/1 system-ui, sans-serif;
+    color: #5c6070;
+    letter-spacing: 0.02em;
+    transition: color 0.28s ease;
+  }
+
+  .mode-label.active {
+    color: #d7cbb8;
+    font-weight: 700;
+  }
+
+  .venn {
+    width: 3.75rem;
+    height: 2.125rem;
+    overflow: visible;
+  }
+
+  .ring {
+    fill: none;
+    stroke: #43474f;
+    stroke-width: 2.2;
+    transition:
+      stroke 0.28s ease,
+      transform 0.28s ease;
+  }
+
+  /* Left channel is always on; the right circle lights up and slides inward
+     (interlocked) in stereo, and dims + pulls apart in mono. */
+  .ring.left {
+    stroke: #d7cbb8;
+  }
+
+  .ring.right {
+    transform: translateX(9px);
+  }
+
+  .venn.on .ring.right {
+    stroke: #d7cbb8;
+    transform: translateX(0);
   }
 
   .toggle {
