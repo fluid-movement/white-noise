@@ -37,53 +37,122 @@
   let dragging: "low" | "high" | null = $state(null);
 
   let track: HTMLDivElement;
-
-  let ctx: AudioContext | null = null;
-  let highpass: BiquadFilterNode | null = null;
-  let lowpass: BiquadFilterNode | null = null;
-  let gain: GainNode | null = null;
-  // Terminal sink: the graph feeds a MediaStream that a real <audio> element
-  // plays. Chrome/Android only keeps a bare AudioContext running in the
-  // background when its output drives an actively-playing media element, so
-  // this is what keeps the noise alive with the screen locked or the app
-  // backgrounded (and it's what surfaces the lock-screen media controls).
-  let streamDest: MediaStreamAudioDestinationNode | null = null;
   let audioEl: HTMLAudioElement;
+
+  // A bare AudioContext (or Web-Audio MediaStream) is throttled in the
+  // background on Chrome/Android and never surfaces a media session. The only
+  // thing the OS keeps alive with the screen locked — and shows lock-screen
+  // controls for — is a genuine <audio> element playing a real resource. So we
+  // render the filtered noise offline into a looping WAV blob and play *that*.
+  let currentUrl: string | null = null;
+  let renderToken = 0;
+  let fadeHandle = 0;
   let mediaSessionReady = false;
 
-  async function ensureAudio() {
-    if (ctx) return;
-    ctx = new AudioContext();
-
-    // Wire up the media sink and start the <audio> element playing *before* any
-    // await, so the first tap's user-gesture activation isn't already spent by
-    // the time play() runs. Mobile browsers only exempt a genuinely-playing
-    // media element from background / lock-screen throttling. The stream is
-    // silent until the graph is connected just below.
-    streamDest = ctx.createMediaStreamDestination();
-    audioEl.srcObject = streamDest.stream;
-    audioEl.play().catch(() => {});
-
-    await ctx.audioWorklet.addModule("/noise-processor.js");
-    const noise = new AudioWorkletNode(ctx, "noise-processor");
-    highpass = new BiquadFilterNode(ctx, {
-      type: "highpass",
-      frequency: toHz(low),
-    });
-    lowpass = new BiquadFilterNode(ctx, {
-      type: "lowpass",
-      frequency: toHz(high),
-    });
-    gain = new GainNode(ctx, { gain: 0 });
-    noise.connect(highpass).connect(lowpass).connect(gain).connect(streamDest);
+  // Encode an AudioBuffer to a 16-bit PCM WAV so a plain <audio> element can
+  // loop it as an ordinary media resource.
+  function audioBufferToWav(buffer: AudioBuffer): ArrayBuffer {
+    const numCh = buffer.numberOfChannels;
+    const sr = buffer.sampleRate;
+    const frames = buffer.length;
+    const blockAlign = numCh * 2;
+    const dataSize = frames * blockAlign;
+    const out = new ArrayBuffer(44 + dataSize);
+    const view = new DataView(out);
+    const writeStr = (off: number, s: string) => {
+      for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i));
+    };
+    writeStr(0, "RIFF");
+    view.setUint32(4, 36 + dataSize, true);
+    writeStr(8, "WAVE");
+    writeStr(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true); // PCM
+    view.setUint16(22, numCh, true);
+    view.setUint32(24, sr, true);
+    view.setUint32(28, sr * blockAlign, true);
+    view.setUint16(32, blockAlign, true);
+    view.setUint16(34, 16, true);
+    writeStr(36, "data");
+    view.setUint32(40, dataSize, true);
+    const channels: Float32Array[] = [];
+    for (let ch = 0; ch < numCh; ch++) channels.push(buffer.getChannelData(ch));
+    let offset = 44;
+    for (let i = 0; i < frames; i++) {
+      for (let ch = 0; ch < numCh; ch++) {
+        const s = Math.max(-1, Math.min(1, channels[ch][i]));
+        view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+        offset += 2;
+      }
+    }
+    return out;
   }
 
-  function fadeGain(target: number, duration: number) {
-    if (!ctx || !gain) return;
-    const now = ctx.currentTime;
-    gain.gain.cancelScheduledValues(now);
-    gain.gain.setValueAtTime(gain.gain.value, now);
-    gain.gain.linearRampToValueAtTime(target, now + duration);
+  // Render `dur` seconds of white noise through the highpass/lowpass band at the
+  // given cutoffs. A hard loop point in filtered noise is imperceptible, so no
+  // crossfade is needed. OfflineAudioContext needs no user gesture.
+  async function renderLoop(lowV: number, highV: number): Promise<Blob> {
+    const sr = 44100;
+    const dur = 15;
+    const frames = sr * dur;
+    const oac = new OfflineAudioContext(2, frames, sr);
+    const noiseBuf = oac.createBuffer(2, frames, sr);
+    for (let ch = 0; ch < 2; ch++) {
+      const data = noiseBuf.getChannelData(ch);
+      for (let i = 0; i < frames; i++) data[i] = Math.random() * 2 - 1;
+    }
+    const src = oac.createBufferSource();
+    src.buffer = noiseBuf;
+    const hp = new BiquadFilterNode(oac, {
+      type: "highpass",
+      frequency: toHz(lowV),
+    });
+    const lp = new BiquadFilterNode(oac, {
+      type: "lowpass",
+      frequency: toHz(highV),
+    });
+    src.connect(hp).connect(lp).connect(oac.destination);
+    src.start(0);
+    const rendered = await oac.startRendering();
+    return new Blob([audioBufferToWav(rendered)], { type: "audio/wav" });
+  }
+
+  // Render the loop for the current band and hand it to the <audio> element.
+  // Pre-rendered on mount so the first play() can run synchronously inside the
+  // tap gesture. `renderToken` discards a render that a newer one superseded.
+  async function setLoop(lowV: number, highV: number) {
+    const token = ++renderToken;
+    const blob = await renderLoop(lowV, highV);
+    if (token !== renderToken) return;
+    const url = URL.createObjectURL(blob);
+    audioEl.src = url;
+    audioEl.loop = true;
+    if (currentUrl) URL.revokeObjectURL(currentUrl);
+    currentUrl = url;
+    if (playing) {
+      audioEl.volume = 0;
+      try {
+        await audioEl.play();
+      } catch {
+        // ignore
+      }
+      rampVolume(1, 0.2);
+    }
+  }
+
+  // iOS ignores media-element volume, so this is a no-op there (instant start),
+  // which is acceptable. On Android/desktop it gives the gentle fade.
+  function rampVolume(target: number, duration: number, done?: () => void) {
+    cancelAnimationFrame(fadeHandle);
+    const start = audioEl.volume;
+    const t0 = performance.now();
+    const step = (now: number) => {
+      const p = duration <= 0 ? 1 : Math.min(1, (now - t0) / (duration * 1000));
+      audioEl.volume = start + (target - start) * p;
+      if (p < 1) fadeHandle = requestAnimationFrame(step);
+      else done?.();
+    };
+    fadeHandle = requestAnimationFrame(step);
   }
 
   function setPlaybackState(state: MediaSessionPlaybackState) {
@@ -102,61 +171,44 @@
         ],
       });
     }
-    navigator.mediaSession.setActionHandler("play", () => resumePlayback());
+    navigator.mediaSession.setActionHandler("play", () => startPlayback());
     navigator.mediaSession.setActionHandler("pause", () => pausePlayback());
   }
 
-  async function resumePlayback() {
-    await ensureAudio();
-    if (!ctx || !gain) return;
-    if (ctx.state === "suspended") await ctx.resume();
-    // Must run inside a user gesture the first time; the MediaSession play
-    // handler also counts as an activation on Android.
-    await audioEl.play().catch(() => {});
-    setupMediaSession();
-    fadeGain(1, FADE_IN);
+  async function startPlayback() {
+    // src is normally pre-rendered on mount; guard in case it isn't ready yet.
+    if (!audioEl.src) await setLoop(low, high);
+    audioEl.loop = true;
+    audioEl.volume = 0;
+    try {
+      await audioEl.play();
+    } catch {
+      return;
+    }
+    rampVolume(1, FADE_IN);
     playing = true;
+    setupMediaSession();
     setPlaybackState("playing");
   }
 
   function pausePlayback() {
-    if (!ctx || !gain) return;
-    // Fade to (near) silence but keep the stream + <audio> element playing so
-    // resume is instant and doesn't need a fresh gesture.
-    fadeGain(0.0001, FADE_OUT);
+    rampVolume(0, FADE_OUT, () => audioEl.pause());
     playing = false;
     setPlaybackState("paused");
   }
 
   function toggle() {
     if (playing) pausePlayback();
-    else resumePlayback();
-  }
-
-  // Recovery net: if the OS suspended the context / media element while we were
-  // backgrounded, resume them when the page becomes visible again. Mainly
-  // relevant on iOS, where background suspension is less predictable.
-  function recoverPlayback() {
-    if (document.visibilityState !== "visible" || !playing || !ctx) return;
-    if (ctx.state === "suspended") ctx.resume();
-    if (audioEl?.paused) audioEl.play().catch(() => {});
+    else startPlayback();
   }
 
   onMount(() => {
-    document.addEventListener("visibilitychange", recoverPlayback);
-    window.addEventListener("pageshow", recoverPlayback);
+    // Pre-render the stored band so the first tap plays instantly and in-gesture.
+    setLoop(low, high);
     return () => {
-      document.removeEventListener("visibilitychange", recoverPlayback);
-      window.removeEventListener("pageshow", recoverPlayback);
+      if (currentUrl) URL.revokeObjectURL(currentUrl);
     };
   });
-
-  function updateFilters() {
-    if (!ctx || !highpass || !lowpass) return;
-    const now = ctx.currentTime;
-    highpass.frequency.setTargetAtTime(toHz(low), now, 0.01);
-    lowpass.frequency.setTargetAtTime(toHz(high), now, 0.01);
-  }
 
   function persist() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ low, high }));
@@ -180,13 +232,14 @@
     } else {
       high = Math.max(value, low + MIN_GAP);
     }
-    updateFilters();
   }
 
   function endDrag() {
     if (!dragging) return;
     dragging = null;
     persist();
+    // Re-render the loop for the new band (and hot-swap it if playing).
+    setLoop(low, high);
   }
 </script>
 
@@ -260,6 +313,8 @@
     </div>
     <span class="label">bright</span>
   </div>
+
+  <span class="version">v2 · file-loop</span>
 </main>
 
 <style>
@@ -284,6 +339,18 @@
     box-sizing: border-box;
     user-select: none;
     touch-action: none;
+  }
+
+  /* Temporary build marker so the installed PWA can be confirmed updated on
+     device; remove once background playback is verified. */
+  .version {
+    position: fixed;
+    bottom: calc(env(safe-area-inset-bottom) + 0.5rem);
+    right: 0.75rem;
+    font: 500 0.65rem/1 system-ui, sans-serif;
+    color: #33363f;
+    letter-spacing: 0.03em;
+    pointer-events: none;
   }
 
   .toggle {
