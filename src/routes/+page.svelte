@@ -1,6 +1,4 @@
 <script lang="ts">
-  import { onMount } from "svelte";
-
   const MIN_HZ = 50;
   const MAX_HZ = 1500;
   const MIN_GAP = 0.05;
@@ -45,130 +43,54 @@
   let track: HTMLDivElement;
   let audioEl: HTMLAudioElement;
 
-  // A bare AudioContext (or Web-Audio MediaStream) is throttled in the
-  // background on Chrome/Android and never surfaces a media session. The only
-  // thing the OS keeps alive with the screen locked — and shows lock-screen
-  // controls for — is a genuine <audio> element playing a real resource. So we
-  // render the filtered noise offline into a looping WAV blob and play *that*.
-  let currentUrl: string | null = null;
-  let renderToken = 0;
-  let fadeHandle = 0;
+  // The noise is a real looping <audio> file (static/noise.wav) played *through*
+  // live Web Audio filters. A genuine media element is what Android keeps alive
+  // in the background and shows lock-screen controls for; routing it through the
+  // graph keeps the band filter (and mute) fully live — no re-rendering.
+  let ctx: AudioContext | null = null;
+  let highpass: BiquadFilterNode | null = null;
+  let lowpass: BiquadFilterNode | null = null;
+  let gain: GainNode | null = null;
+  let monoGain: GainNode | null = null;
   let mediaSessionReady = false;
 
-  // Encode an AudioBuffer to a 16-bit PCM WAV so a plain <audio> element can
-  // loop it as an ordinary media resource.
-  function audioBufferToWav(buffer: AudioBuffer): ArrayBuffer {
-    const numCh = buffer.numberOfChannels;
-    const sr = buffer.sampleRate;
-    const frames = buffer.length;
-    const blockAlign = numCh * 2;
-    const dataSize = frames * blockAlign;
-    const out = new ArrayBuffer(44 + dataSize);
-    const view = new DataView(out);
-    const writeStr = (off: number, s: string) => {
-      for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i));
-    };
-    writeStr(0, "RIFF");
-    view.setUint32(4, 36 + dataSize, true);
-    writeStr(8, "WAVE");
-    writeStr(12, "fmt ");
-    view.setUint32(16, 16, true);
-    view.setUint16(20, 1, true); // PCM
-    view.setUint16(22, numCh, true);
-    view.setUint32(24, sr, true);
-    view.setUint32(28, sr * blockAlign, true);
-    view.setUint16(32, blockAlign, true);
-    view.setUint16(34, 16, true);
-    writeStr(36, "data");
-    view.setUint32(40, dataSize, true);
-    const channels: Float32Array[] = [];
-    for (let ch = 0; ch < numCh; ch++) channels.push(buffer.getChannelData(ch));
-    let offset = 44;
-    for (let i = 0; i < frames; i++) {
-      for (let ch = 0; ch < numCh; ch++) {
-        const s = Math.max(-1, Math.min(1, channels[ch][i]));
-        view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-        offset += 2;
-      }
-    }
-    return out;
-  }
-
-  // Render `dur` seconds of white noise through the highpass/lowpass band at the
-  // given cutoffs. A hard loop point in filtered noise is imperceptible, so no
-  // crossfade is needed. OfflineAudioContext needs no user gesture.
-  async function renderLoop(
-    lowV: number,
-    highV: number,
-    stereoV: boolean,
-  ): Promise<Blob> {
-    const sr = 44100;
-    const dur = 15;
-    const frames = sr * dur;
-    const oac = new OfflineAudioContext(2, frames, sr);
-    const noiseBuf = oac.createBuffer(2, frames, sr);
-    const left = noiseBuf.getChannelData(0);
-    const right = noiseBuf.getChannelData(1);
-    for (let i = 0; i < frames; i++) left[i] = Math.random() * 2 - 1;
-    // stereo → independent noise in the right channel (wide/decorrelated);
-    // mono → copy the left channel so both are identical (centered).
-    if (stereoV) {
-      for (let i = 0; i < frames; i++) right[i] = Math.random() * 2 - 1;
-    } else {
-      right.set(left);
-    }
-    const src = oac.createBufferSource();
-    src.buffer = noiseBuf;
-    const hp = new BiquadFilterNode(oac, {
+  function ensureAudio() {
+    if (ctx) return;
+    ctx = new AudioContext();
+    const source = ctx.createMediaElementSource(audioEl);
+    highpass = new BiquadFilterNode(ctx, {
       type: "highpass",
-      frequency: toHz(lowV),
+      frequency: toHz(low),
     });
-    const lp = new BiquadFilterNode(oac, {
+    lowpass = new BiquadFilterNode(ctx, {
       type: "lowpass",
-      frequency: toHz(highV),
+      frequency: toHz(high),
     });
-    src.connect(hp).connect(lp).connect(oac.destination);
-    src.start(0);
-    const rendered = await oac.startRendering();
-    return new Blob([audioBufferToWav(rendered)], { type: "audio/wav" });
+    gain = new GainNode(ctx, { gain: 0 });
+    // Downmix stereo → mono (0.5·L + 0.5·R), then up-mix back to both speakers.
+    monoGain = ctx.createGain();
+    monoGain.channelCount = 1;
+    monoGain.channelCountMode = "explicit";
+    monoGain.channelInterpretation = "speakers";
+    monoGain.connect(ctx.destination);
+    source.connect(highpass).connect(lowpass).connect(gain);
+    applyRouting();
   }
 
-  // Render the loop for the current band and hand it to the <audio> element.
-  // Pre-rendered on mount so the first play() can run synchronously inside the
-  // tap gesture. `renderToken` discards a render that a newer one superseded.
-  async function setLoop(lowV: number, highV: number, stereoV: boolean) {
-    const token = ++renderToken;
-    const blob = await renderLoop(lowV, highV, stereoV);
-    if (token !== renderToken) return;
-    const url = URL.createObjectURL(blob);
-    audioEl.src = url;
-    audioEl.loop = true;
-    if (currentUrl) URL.revokeObjectURL(currentUrl);
-    currentUrl = url;
-    if (playing) {
-      audioEl.volume = 0;
-      try {
-        await audioEl.play();
-      } catch {
-        // ignore
-      }
-      rampVolume(1, 0.2);
-    }
+  // Route the wet signal either straight to the speakers (stereo) or through the
+  // mono downmix (mono). Called on setup and whenever the mode toggles.
+  function applyRouting() {
+    if (!ctx || !gain || !monoGain) return;
+    gain.disconnect();
+    gain.connect(stereo ? ctx.destination : monoGain);
   }
 
-  // iOS ignores media-element volume, so this is a no-op there (instant start),
-  // which is acceptable. On Android/desktop it gives the gentle fade.
-  function rampVolume(target: number, duration: number, done?: () => void) {
-    cancelAnimationFrame(fadeHandle);
-    const start = audioEl.volume;
-    const t0 = performance.now();
-    const step = (now: number) => {
-      const p = duration <= 0 ? 1 : Math.min(1, (now - t0) / (duration * 1000));
-      audioEl.volume = start + (target - start) * p;
-      if (p < 1) fadeHandle = requestAnimationFrame(step);
-      else done?.();
-    };
-    fadeHandle = requestAnimationFrame(step);
+  function fadeGain(target: number, duration: number) {
+    if (!ctx || !gain) return;
+    const now = ctx.currentTime;
+    gain.gain.cancelScheduledValues(now);
+    gain.gain.setValueAtTime(gain.gain.value, now);
+    gain.gain.linearRampToValueAtTime(target, now + duration);
   }
 
   function setPlaybackState(state: MediaSessionPlaybackState) {
@@ -188,43 +110,39 @@
       });
     }
     navigator.mediaSession.setActionHandler("play", () => startPlayback());
-    navigator.mediaSession.setActionHandler("pause", () => pausePlayback());
+    navigator.mediaSession.setActionHandler("pause", () => mute());
   }
 
   async function startPlayback() {
-    // src is normally pre-rendered on mount; guard in case it isn't ready yet.
-    if (!audioEl.src) await setLoop(low, high, stereo);
-    audioEl.loop = true;
-    audioEl.volume = 0;
-    try {
-      await audioEl.play();
-    } catch {
-      return;
-    }
-    rampVolume(1, FADE_IN);
+    ensureAudio();
+    if (!ctx) return;
+    if (ctx.state === "suspended") await ctx.resume();
+    await audioEl.play().catch(() => {});
+    fadeGain(1, FADE_IN);
     playing = true;
     setupMediaSession();
     setPlaybackState("playing");
   }
 
-  function pausePlayback() {
-    rampVolume(0, FADE_OUT, () => audioEl.pause());
+  // Mute is just a gain fade — the element keeps playing, so unmuting is instant
+  // and there are no play/pause or src-swap races.
+  function mute() {
+    fadeGain(0, FADE_OUT);
     playing = false;
     setPlaybackState("paused");
   }
 
   function toggle() {
-    if (playing) pausePlayback();
+    if (playing) mute();
     else startPlayback();
   }
 
-  onMount(() => {
-    // Pre-render the stored band so the first tap plays instantly and in-gesture.
-    setLoop(low, high, stereo);
-    return () => {
-      if (currentUrl) URL.revokeObjectURL(currentUrl);
-    };
-  });
+  function updateFilters() {
+    if (!ctx || !highpass || !lowpass) return;
+    const now = ctx.currentTime;
+    highpass.frequency.setTargetAtTime(toHz(low), now, 0.01);
+    lowpass.frequency.setTargetAtTime(toHz(high), now, 0.01);
+  }
 
   function persist() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ low, high, stereo }));
@@ -233,8 +151,7 @@
   function toggleStereo() {
     stereo = !stereo;
     persist();
-    // Re-render the loop with the new channel correlation (hot-swaps if playing).
-    setLoop(low, high, stereo);
+    applyRouting();
   }
 
   function fractionFromPointer(clientX: number) {
@@ -255,18 +172,24 @@
     } else {
       high = Math.max(value, low + MIN_GAP);
     }
+    updateFilters();
   }
 
   function endDrag() {
     if (!dragging) return;
     dragging = null;
     persist();
-    // Re-render the loop for the new band (and hot-swap it if playing).
-    setLoop(low, high, stereo);
   }
 </script>
 
-<audio bind:this={audioEl} playsinline hidden></audio>
+<audio
+  bind:this={audioEl}
+  src="/noise.wav"
+  loop
+  preload="auto"
+  playsinline
+  hidden
+></audio>
 
 <main>
   <button
@@ -352,7 +275,7 @@
     <span class="mode-label" class:active={stereo}>stereo</span>
   </button>
 
-  <span class="version">v2 · file-loop</span>
+  <span class="version">v3 · live</span>
 </main>
 
 <style>
