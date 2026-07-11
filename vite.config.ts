@@ -17,8 +17,11 @@ export default defineConfig({
 			adapter: adapter()
 		}),
 		SvelteKitPWA({
-			registerType: 'autoUpdate',
-			// We register the service worker ourselves in +layout.svelte.
+			// Prompt (not autoUpdate): a new deploy surfaces an in-app "update
+			// available" pill instead of silently reloading, so an update never
+			// interrupts noise that's playing. Registration + polling live in
+			// +layout.svelte.
+			registerType: 'prompt',
 			injectRegister: false,
 			manifest: {
 				name: 'White Noise',
